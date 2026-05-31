@@ -1,0 +1,284 @@
+import rclpy
+from rclpy.node import Node
+from control_node.pid import PID
+from rov_msg.srv import Circle, Cruise
+from rclpy.action import ActionServer
+from rov_msg.action import MoveTo
+from rov_msg.msg import Imu, Dvl, Controller as ControllerMsg , PidMsg
+import math
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+import time
+#手算坐标系不准，调pid也不会准o～o
+from turtlesim.msg import Pose
+
+class Controller(Node):
+    def __init__(self):
+        super().__init__('controller')
+        #controller是客户端，目前暂定是命令行是客户端
+        self.circle_server = self.create_service(Circle, 'circle', self.circle_callback)
+        self.cruise_server = self.create_service(Cruise, 'cruise', self.cruise_callback)
+        self.action_cb_group = ReentrantCallbackGroup()
+        self.action_server = ActionServer(
+            self,
+            MoveTo,
+            'move_to',
+            self.move_to_callback,
+            callback_group=self.action_cb_group
+        )
+        self.PID_Speed = PID()
+        self.PID_Angle = PID()
+        self.PID_Pos   = PID()
+        self.PID_Speed.MAXOutput = 12.0
+        self.PID_Speed.MAXIntegral = 4.0
+        self.PID_Angle.MAXOutput = 5.0
+        self.PID_Angle.MAXIntegral = 2.0
+        self.PID_Pos.MAXOutput = 1.5
+        self.pid_t = 0.01 #PID周期
+        self.current_goal_handle = None #用来存当前的goal_handle
+        self.m = 1.0      #单位：kg
+        self.I_z = 0.5    #转动惯量
+        self.c = 0.5      #流体阻力系数
+        self.c_r = 0.3    #旋转阻力系数
+        self.F_max = 10.0 #最大阻力
+        self.τ_max = 5.0  #最大扭矩
+        self.τ = 0.0      #扭矩
+        self.L = 0.1      #力臂
+        self.a_y = 0.0    #平动y加速度
+        self.a_x = 0.0    #x加速度
+        self.v_y_last = 0.0 #上一时刻的v_y
+        self.w_last = 0.0   #上一时刻的w
+        self.F_y = 0.0    #当前y推力
+        self.F1 = 0.0     #左推进器
+        self.F2 = 0.0     #右推进器
+        self.a_yaw = 0.0  #角加速度
+        self.v_x = 0.0    #当前x轴线速度
+        self.v_y = 0.0    #当前y轴线速度
+        self.tar_v_y = 0.0  #目标v_y
+        self.tar_w = 0.0    #目标w
+        self.w = 0.0      #角速度
+        self.x_world = 5.44  #世界坐标系x
+        self.y_world = 5.44  #世界坐标系y
+        self.target_x = 0.0 #目标x轴坐标
+        self.target_y = 0.0 #目标y轴坐标
+        self.distance = 0.0 #距离
+        self.tar_angle = 0.0    #目标角度
+        self.angle = 0.0        #实际角度
+        self.pos_flag = False #位置环的标志位
+        self.handle_flag = False
+        self.feedback_msg = None
+        self.PID_timer = self.create_timer(self.pid_t, self.PID_callback)
+        self.imu_sub = self.create_subscription(Imu, 'imu', self.imu_callback, 10)
+        self.dvl_sub = self.create_subscription(Dvl, 'dvl', self.dvl_callback, 10)
+        self.controller_pub = self.create_publisher(ControllerMsg, 'thrust_cmd', 10)
+        self.create_subscription(PidMsg, 'speed_pid', self.speed_param_callback, 10)
+        self.create_subscription(PidMsg, 'angle_pid', self.angle_param_callback, 10)
+        self.create_subscription(Pose, '/turtle1/pose', self.pose_callback, 10)
+        self.create_subscription(PidMsg, 'pos_pid', self.pos_param_callback, 10)
+        self.log_timer = self.create_timer(0.5, self.log_callback)
+        #wok啊之前的用不上了，就放这里用来学习吧，额我说我
+        # #嘿嘿，“注意到”还是很好用的^v^
+        # for client in self.clients:
+        #     while not client.wait_for_service(timeout_sec=1.0):
+        #         self.get_logger().info(f'等待客户端{client.srv_name}')
+        # self.get_logger().info('启动！')
+    
+    #画圆服务回调    
+    def circle_callback(self, request, response):
+        response.success = True
+        self.pos_flag = False
+        #em这算是python的三目运算吗？
+        #这里算是给的目标速度吧
+        self.tar_w = request.v if request.r == 0 else request.v / request.r
+        self.tar_v_y = request.v
+        self.v_x = 0.0
+        self.get_logger().info(f'来活儿了\n r = {request.r:.2f} v = {request.v:.2f}')
+        return response
+    
+    #定速巡航服务回调
+    def cruise_callback(self, request, response):
+        response.success = True
+        self.pos_flag = False
+        #0.0可爱捏
+        self.tar_v_y = request.speed 
+        self.v_x = 0.0
+        self.tar_w = 0.0
+        self.get_logger().info(f'speed = {request.speed:.2f}')
+        return response
+    
+    #定点动作回调
+    def move_to_callback(self, goal_handle):
+        self.PID_Pos.integral_sum = 0 # 清空位置 PID 的陈年旧账
+        self.pos_flag = True
+        self.handle_flag = False
+        self.get_logger().info("龟速前进ing 0v0")
+        self.target_x = goal_handle.request.target_x
+        self.target_y = goal_handle.request.target_y
+        self.get_logger().info(f"目的地: X= {self.target_x}, Y = {self.target_y}")
+       
+        self.feedback_msg = MoveTo.Feedback()
+        self.current_goal_handle = goal_handle
+
+        while rclpy.ok():
+            #以下是定点移动逻辑，包括计算位移矢量角
+            self.distance = math.hypot(self.target_y - self.y_world, self.target_x - self.x_world)
+            self.tar_angle = math.atan2(self.target_y - self.y_world, self.target_x - self.x_world)
+            if self.distance < 0.1:
+                self.pos_flag = False
+                self.handle_flag = True
+                break
+            time.sleep(0.05)
+
+        if self.handle_flag:
+            #标记动作完成并反馈
+            goal_handle.succeed()
+            result = MoveTo.Result()
+            self.tar_w = 0.0
+            self.tar_v_y = 0.0
+            self.PID_Angle.integral_sum = 0.0
+            self.PID_Speed.integral_sum = 0.0
+            self.get_logger().info("成功抵达！乌拉！:)")
+            return result  
+    
+    def log_callback(self):
+        if not self.handle_flag and self.pos_flag and (self.feedback_msg is not None):
+            #返回当前进度
+            self.feedback_msg.current_x = float(self.x_world)
+            self.feedback_msg.current_y = float(self.y_world)
+            self.get_logger().info(f"当前: X = {self.feedback_msg.current_x}, Y = {self.feedback_msg.current_y}")
+            self.current_goal_handle.publish_feedback(self.feedback_msg)
+
+    def response_circle_callback(self, future):
+        try:
+            response = future.result()
+            self.get_logger().info(f'哦了,收到{response.success}')
+        except Exception as e:
+            self.get_logger().error(f'咋失败了捏o-o:{e}')
+
+    def response_cruise_callback(self, future):
+        try:
+            response = future.result()
+            self.get_logger().info(f'哦了,收到{response.success}')
+        except Exception as e:
+            self.get_logger().error(f'咋失败了捏o-o:{e}')
+
+    def imu_callback(self, imu_msg: Imu):
+        self.a_x = imu_msg.a_x 
+        self.a_y = imu_msg.a_y 
+        self.w = imu_msg.w 
+    
+    def dvl_callback(self, dvl_msg: Dvl):
+        self.v_x = dvl_msg.v_x 
+        self.v_y = dvl_msg.v_y
+
+    def pose_callback(self, msg:Pose):
+        self.x_world = msg.x
+        self.y_world = msg.y
+        self.angle = msg.theta
+
+    #PID的回调，里面包含了计算过程
+    def PID_callback(self):
+        #限幅
+        # self.angle += self.w * self.pid_t 
+        error_angle = self.tar_angle - self.angle
+        while error_angle > math.pi:
+            error_angle -= 2 * math.pi
+        while error_angle < -math.pi:
+            error_angle += 2 * math.pi
+        adjusted_angle = error_angle + self.angle
+        #依旧是内环是位置式，外环是增量式，此外环是给定点用的，别整混了
+        if self.pos_flag:
+            self.tar_w = self.PID_Pos.Position_PID(adjusted_angle, self.angle)
+            self.tar_w = max(-1.2, min(self.tar_w, 1.2))
+            if abs(error_angle) < 1:  #差27度左右给y向速度
+                self.tar_v_y = min(0.8, max(-0.4, self.distance * 0.8))
+            else:
+                self.tar_v_y = 0.2
+        else: 
+            pass
+        # #计算当前坐标，给定点移动用的，由于x轴方向没有推进器，故机器人坐标系里，x轴没有位移，算是一种简化吧
+        # filter_v_y = 0.0 if abs(self.v_y) < 0.01 else self.v_y
+        # y_body = filter_v_y * self.pid_t
+        # self.x_world += y_body * math.cos(self.angle)
+        # self.y_world += y_body * math.sin(self.angle)
+        #阻力算是加了个前馈吧
+        F_y_pid = self.PID_Speed.Position_PID(self.tar_v_y, self.v_y)     #输出的直接是力
+        τ_pid = self.PID_Angle.Position_PID(self.tar_w, self.w)
+        F_y_f = self.c * self.v_y * abs(self.v_y)
+        self.F_y = F_y_f + F_y_pid 
+        τ_f = self.c_r * self.w * abs(self.w)
+        self.τ = τ_pid + τ_f 
+        self.F1 = min(self.F_max, max(-self.F_max, 1/2 * (self.F_y + self.τ / self.L)))
+        self.F2 = min(self.F_max, max(-self.F_max, 1/2 * (self.F_y - self.τ / self.L)))
+        msg = ControllerMsg()
+        msg.f1 = self.F1
+        msg.f2 = self.F2
+        msg.tau = self.τ
+        self.controller_pub.publish(msg)
+        #同步上一时刻的速度
+        self.v_y_last = self.v_y
+        self.w_last = self.w
+
+    #改参数
+    def speed_param_callback(self, msg):
+        self.PID_Speed.Set_Param(msg, 1)
+        self.PID_Speed.integral_sum = 0
+    
+    def angle_param_callback(self, msg):
+        self.PID_Angle.Set_Param(msg, 1)
+        self.PID_Angle.integral_sum = 0
+
+    def pos_param_callback(self, msg):
+        self.PID_Pos.Set_Param(msg, 1)
+        self.PID_Pos.integral_sum = 0
+
+def main(args = None):
+    rclpy.init(args = args)
+    node = Controller()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+
+#留着以后搞个单独的上位机界面用
+  # #圆
+    # def send_circle_request(self, r, v):
+    #     req = Circle.Request()
+    #     #赋值
+    #     req.r = float(r)
+    #     req.v = float(v)
+    #     #异步发送，得到凭证future
+    #     self.future = self.client1.call_async(req)
+    #     self.future.add_done_callback(self.response_circle_callback)
+
+     # #定速
+    # def send_cruise_request(self, speed):
+    #     req = Cruise.Request()
+    #     #赋值
+    #     req.speed = float(speed)
+    #     #异步发送，得到凭证future
+    #     self.future = self.client2.call_async(req)
+    #     self.future.add_done_callback(self.response_cruise_callback)
+
+
+#这两行扔main里面
+    # #发送请求
+    # node.send_circle_request()
+    # node.send_cruise_request()
+
+    #ros2 service call /cruise rov_msg/srv/Cruise "{speed: 1.0}"
+    #ros2 service call /circle rov_msg/srv/Circle "{r: 3.0, v: 2.0}"
+    #ros2 action send_goal /move_to rov_msg/action/MoveTo "{target_x: 6.0, target_y: 6.0}"
+    # cd ~/ros2_ws
+    # source install/setup.bash
+    #ros2 service call /clear std_srvs/srv/Empty

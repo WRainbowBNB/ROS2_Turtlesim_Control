@@ -1,0 +1,10 @@
+#Goal（目标坐标）
+float32 target_x
+float32 target_y
+---
+#Result（最终结果）
+bool success #成功标志
+---
+#Feedback（实时反馈）
+float32 current_x
+float32 current_y
