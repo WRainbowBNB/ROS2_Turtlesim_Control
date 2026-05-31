@@ -15,7 +15,7 @@ from turtlesim.msg import Pose
 class Controller(Node):
     def __init__(self):
         super().__init__('controller')
-        #controller是客户端，目前暂定是命令行是客户端
+        #controller是服务端，目前暂定是命令行是客户端
         self.circle_server = self.create_service(Circle, 'circle', self.circle_callback)
         self.cruise_server = self.create_service(Cruise, 'cruise', self.cruise_callback)
         self.action_cb_group = ReentrantCallbackGroup()
@@ -186,7 +186,7 @@ class Controller(Node):
         while error_angle < -math.pi:
             error_angle += 2 * math.pi
         adjusted_angle = error_angle + self.angle
-        #依旧是内环是位置式，外环是增量式，此外环是给定点用的，别整混了
+        #如果是定点开外环，即位置环，输出w，俩内环一个F的一个扭矩的
         if self.pos_flag:
             self.tar_w = self.PID_Pos.Position_PID(adjusted_angle, self.angle)
             self.tar_w = max(-1.2, min(self.tar_w, 1.2))
@@ -197,6 +197,7 @@ class Controller(Node):
         else: 
             pass
         # #计算当前坐标，给定点移动用的，由于x轴方向没有推进器，故机器人坐标系里，x轴没有位移，算是一种简化吧
+        # 但是实测下来效果不佳，原因有待进一步探索，额就是说我可能会更新这个东西
         # filter_v_y = 0.0 if abs(self.v_y) < 0.01 else self.v_y
         # y_body = filter_v_y * self.pid_t
         # self.x_world += y_body * math.cos(self.angle)

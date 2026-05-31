@@ -24,10 +24,7 @@ class PID():
         #2.计算积分项
         self.integral_sum += self.error[0] * self.PID_DT #周期10ms
         #积分限幅
-        if self.integral_sum > self.MAXIntegral:
-            self.integral_sum = self.MAXIntegral
-        elif self.integral_sum < -self.MAXIntegral:
-            self.integral_sum = -self.MAXIntegral
+        self.integral_sum = min(self.MAXIntegral, max(-self.MAXIntegral, self.integral_sum))
         #3.计算微分项
         self.value_kd = (self.error[0] - self.error[1]) / self.PID_DT   #周期10ms
         #4.计算PID输出
@@ -35,10 +32,7 @@ class PID():
         #更新误差
         self.error[1] = self.error[0]
         #5.输出限幅
-        if self.output > self.MAXOutput:
-            self.output = self.MAXOutput
-        elif self.output < -self.MAXOutput:
-            self.output = -self.MAXOutput
+        self.output = min(self.MAXOutput, max(-self.MAXOutput, self.output))
 
         return self.output
     
@@ -56,11 +50,8 @@ class PID():
         #更新误差
         self.error[2] = self.error[1]
         self.error[1] = self.error[0]
-        #5.输出限幅
-        if self.output > self.MAXOutput:
-            self.output = self.MAXOutput
-        elif self.output < -self.MAXOutput:
-            self.output = -self.MAXOutput
+        #5.输出限幅，这么写更简洁一点
+        self.output = min(self.MAXOutput, max(-self.MAXOutput, self.output))
 
         return self.output
     
