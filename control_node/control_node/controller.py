@@ -190,7 +190,7 @@ class Controller(Node):
         if self.pos_flag:
             self.tar_w = self.PID_Pos.Position_PID(adjusted_angle, self.angle)
             self.tar_w = max(-1.2, min(self.tar_w, 1.2))
-            if abs(error_angle) < 1:  #差27度左右给y向速度
+            if abs(error_angle) < 1:  #差60度左右给y向速度
                 self.tar_v_y = min(0.8, max(-0.4, self.distance * 0.8))
             else:
                 self.tar_v_y = 0.2
